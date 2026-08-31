@@ -13,7 +13,7 @@ dependencies = [
     "pymupdf>=1.24",
     "pytesseract>=0.3.13",
     "pillow>=11.0",
-    "anthropic>=0.40",
+    "anthropic>=1.2.0",
     "openpyxl>=3.1",
     # El inventario en MySQL. Sin esto el servicio arranca igual y guarda en
     # el archivo JSONL, que es lo correcto en una máquina sin base.
