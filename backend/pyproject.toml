@@ -7,7 +7,7 @@ requires-python = ">=3.12"
 # The domain layer has ZERO runtime dependencies on purpose.
 # Everything below is only needed by adapters and the HTTP layer.
 dependencies = [
-    "fastapi>=0.115",
+    "fastapi>=0.141.1",
     "uvicorn[standard]>=0.32",
     "python-multipart>=0.0.12",
     "pymupdf>=1.24",
