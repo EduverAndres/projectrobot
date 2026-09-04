@@ -89,13 +89,20 @@ class TestRenamingAResolution:
         assert (directory / response.json()["file_name"]).is_file()
 
     def test_the_title_can_be_corrected(self, client):
+        """El asunto se corrige, pero ya no mueve el archivo.
+
+        Desde que el nombre es la palabra y el número, corregir el asunto no
+        renombra nada: se guarda donde se busca por texto, que es el inventario.
+        """
         job, file_name, _ = a_processed_document()
         response = client.patch(
             f"/api/jobs/{job.id}/outputs/{file_name}",
             json={"title": "Por la cual se adopta el manual"},
         )
         assert response.json()["title"] == "Por la cual se adopta el manual"
-        assert "manual" in response.json()["file_name"]
+        assert client.get("/api/inventory").json()["rows"][0]["title"] == (
+            "Por la cual se adopta el manual"
+        )
 
     def test_the_inventory_row_moves_with_the_file(self, client):
         job, file_name, _ = a_processed_document(code="0OO86")
@@ -103,7 +110,7 @@ class TestRenamingAResolution:
 
         row = client.get("/api/inventory").json()["rows"][0]
         assert row["code"] == "00086"
-        assert row["file_name"].startswith("00086")
+        assert row["file_name"] == "RESOLUCION_00086.pdf"
 
     def test_the_report_on_screen_moves_with_the_file(self, client):
         job, file_name, _ = a_processed_document(code="0OO86")
@@ -111,7 +118,7 @@ class TestRenamingAResolution:
 
         report = client.get(f"/api/jobs/{job.id}").json()["report"]
         assert [group["code"] for group in report["groups"]] == ["00086"]
-        assert report["outputs"][0].startswith("00086")
+        assert report["outputs"][0] == "RESOLUCION_00086.pdf"
 
     def test_the_renamed_file_is_downloadable_under_its_new_name(self, client):
         job, file_name, _ = a_processed_document(code="0OO86")
@@ -138,7 +145,7 @@ class TestRenamingAResolution:
 
     def test_renaming_onto_an_existing_file_is_refused(self, client):
         job, file_name, directory = a_processed_document()
-        (directory / "00072__otra.pdf").write_bytes(b"%PDF-1.4")
+        (directory / "RESOLUCION_00072.pdf").write_bytes(b"%PDF-1.4")
 
         response = client.patch(
             f"/api/jobs/{job.id}/outputs/{file_name}",
@@ -295,3 +302,352 @@ class TestCorrectionsSurviveAScreenClear:
 
         assert response.status_code == 200
         assert client.get("/api/inventory").json()["rows"][0]["code"] == "00086"
+
+
+def a_document_with_two_resolutions(name: str = "expediente.pdf"):
+    """A finished job whose two resolutions are both on disk and in the ledger."""
+    from resolutions.api import main
+
+    job = main.registry.create(name, Path(name))
+    files = ["00086__acta.pdf", "00087__resuelve.pdf"]
+    report = {
+        "document": name,
+        "page_count": 4,
+        "groups": [
+            {"code": "00086", "title": "Acta", "pages": [1, 2], "size": 2},
+            {"code": "00087", "title": "Resuelve", "pages": [3, 4], "size": 2},
+        ],
+        "review_queue": [],
+        "outputs": files,
+        "inventory": {
+            "source_document": name,
+            "source_pages": 4,
+            "items": [
+                {
+                    "file_name": files[0],
+                    "code": "00086",
+                    "title": "Acta",
+                    "page_count": 2,
+                    "first_page": 1,
+                    "last_page": 2,
+                    "page_numbers": [1, 2],
+                },
+                {
+                    "file_name": files[1],
+                    "code": "00087",
+                    "title": "Resuelve",
+                    "page_count": 2,
+                    "first_page": 3,
+                    "last_page": 4,
+                    "page_numbers": [3, 4],
+                },
+            ],
+        },
+    }
+    main.registry.mark_done(job, report)
+    main.ledger.record(job.id, report)
+
+    directory = main.settings.output_dir / job.id
+    directory.mkdir(parents=True, exist_ok=True)
+    for file_name in files:
+        (directory / file_name).write_bytes(b"%PDF-1.4 out")
+    return job, files, directory
+
+
+class TestRenamingAProcessedDocument:
+    """`PATCH /api/documents/{id}`: the name the archive shows, corrected.
+
+    Distinct from renaming the job, which only reaches the card while it is
+    still on screen. This one has to reach the record, because the archive is
+    read from the ledger long after the screen was cleared.
+    """
+
+    def test_every_row_of_the_document_takes_the_new_name(self, client):
+        job, _, _ = a_document_with_two_resolutions()
+
+        response = client.patch(
+            f"/api/documents/{job.id}", json={"source_document": "Marzo 2024.pdf"}
+        )
+
+        assert response.status_code == 200
+        assert response.json()["rows"] == 2
+        rows = client.get("/api/inventory").json()["rows"]
+        assert {row["source_document"] for row in rows} == {"Marzo 2024.pdf"}
+
+    def test_the_archive_lists_it_once_under_the_new_name(self, client):
+        job, _, _ = a_document_with_two_resolutions()
+        client.patch(f"/api/documents/{job.id}", json={"source_document": "Marzo 2024.pdf"})
+
+        documents = client.get("/api/documents").json()["documents"]
+
+        assert [document["source_document"] for document in documents] == ["Marzo 2024.pdf"]
+
+    def test_the_card_on_screen_takes_it_too(self, client):
+        job, _, _ = a_document_with_two_resolutions()
+        client.patch(f"/api/documents/{job.id}", json={"source_document": "Marzo 2024.pdf"})
+        assert client.get(f"/api/jobs/{job.id}").json()["filename"] == "Marzo 2024.pdf"
+
+    def test_a_document_only_in_the_ledger_can_still_be_renamed(self, client):
+        job, _, _ = a_document_with_two_resolutions()
+        client.request("DELETE", "/api/jobs")
+
+        response = client.patch(
+            f"/api/documents/{job.id}", json={"source_document": "Marzo 2024.pdf"}
+        )
+
+        assert response.status_code == 200
+        assert client.get("/api/documents").json()["documents"][0][
+            "source_document"
+        ] == "Marzo 2024.pdf"
+
+    def test_an_empty_name_is_refused(self, client):
+        job, _, _ = a_document_with_two_resolutions()
+        assert (
+            client.patch(f"/api/documents/{job.id}", json={"source_document": "  "}).status_code
+            == 422
+        )
+
+    def test_a_name_that_is_a_path_is_refused(self, client):
+        # The name is drawn on a screen and written to the ledger; it is not a
+        # place on disk, and a separator in it would say otherwise.
+        job, _, _ = a_document_with_two_resolutions()
+        for attempt in ("../otro.pdf", "carpeta/otro.pdf"):
+            response = client.patch(
+                f"/api/documents/{job.id}", json={"source_document": attempt}
+            )
+            assert response.status_code == 422, attempt
+
+    def test_renaming_an_unknown_document_is_not_found(self, client):
+        assert (
+            client.patch("/api/documents/ghost", json={"source_document": "x.pdf"}).status_code
+            == 404
+        )
+
+
+class TestErasingAProcessedDocument:
+    """`DELETE /api/documents/{id}`: the one deletion that leaves nothing.
+
+    Clearing the screen forgets a job and keeps the work. This discards the
+    work: the generated PDFs, the inventory rows and the card, together, so
+    nothing is left pointing at something that is gone.
+    """
+
+    def test_the_files_the_rows_and_the_card_all_go(self, client):
+        job, files, directory = a_document_with_two_resolutions()
+
+        response = client.request("DELETE", f"/api/documents/{job.id}")
+
+        assert response.status_code == 200
+        assert response.json()["rows"] == 2
+        assert not directory.exists()
+        assert client.get("/api/inventory").json()["rows"] == []
+        assert client.get("/api/documents").json()["documents"] == []
+        assert client.get(f"/api/jobs/{job.id}").status_code == 404
+
+    def test_the_other_documents_are_untouched(self, client):
+        first, _, first_directory = a_document_with_two_resolutions("enero.pdf")
+        a_document_with_two_resolutions("febrero.pdf")
+
+        client.request("DELETE", f"/api/documents/{first.id}")
+
+        assert not first_directory.exists()
+        documents = client.get("/api/documents").json()["documents"]
+        assert [document["source_document"] for document in documents] == ["febrero.pdf"]
+
+    def test_a_document_only_in_the_ledger_can_still_be_erased(self, client):
+        job, _, directory = a_document_with_two_resolutions()
+        client.request("DELETE", "/api/jobs")
+
+        response = client.request("DELETE", f"/api/documents/{job.id}")
+
+        assert response.status_code == 200
+        assert response.json()["from_screen"] is False
+        assert not directory.exists()
+        assert client.get("/api/inventory").json()["rows"] == []
+
+    def test_a_document_still_being_processed_is_refused(self, client):
+        from resolutions.api import main
+
+        job = main.registry.create("a.pdf", Path("a.pdf"))
+        main.registry.mark_running(job)
+
+        assert client.request("DELETE", f"/api/documents/{job.id}").status_code == 409
+        assert client.get(f"/api/jobs/{job.id}").status_code == 200
+
+    def test_erasing_one_that_is_not_there_is_not_found(self, client):
+        assert client.request("DELETE", "/api/documents/ghost").status_code == 404
+
+    def test_the_swept_scratch_no_longer_counts_it_as_referenced(self, client):
+        # The janitor keeps output whose job is still in the ledger. Once the
+        # document is erased, nothing refers to it and nothing is left behind.
+        from resolutions.api import main
+
+        job, _, directory = a_document_with_two_resolutions()
+        client.request("DELETE", f"/api/documents/{job.id}")
+
+        assert job.id not in main.ledger.job_ids()
+        assert not directory.exists()
+
+
+# -----------------------------------------------------------------------------
+#  Borrar varios documentos de una vez
+# -----------------------------------------------------------------------------
+#  Vaciar una caja mal procesada son decenas de documentos, y de a uno son
+#  decenas de confirmaciones. El lote no es una transacción y no debe parecerlo:
+#  cada documento dice lo suyo, y uno que falla no cancela los demás.
+# -----------------------------------------------------------------------------
+
+
+class TestBorradoEnLote:
+    def _procesado(self, client, nombre: str) -> str:
+        """Un documento terminado en el registro, con su carpeta de salida."""
+        from resolutions.api import main
+
+        job = main.registry.create(nombre, main.settings.upload_dir / nombre)
+        main.registry.mark_done(job, {"document": nombre, "page_count": 1})
+        (main.settings.output_dir / job.id).mkdir(parents=True, exist_ok=True)
+        return job.id
+
+    def test_borra_todos_los_que_se_le_den(self, client):
+        ids = [self._procesado(client, f"doc-{n}.pdf") for n in range(3)]
+        respuesta = client.request("DELETE", "/api/documents", json={"job_ids": ids})
+        assert respuesta.status_code == 200
+        cuerpo = respuesta.json()
+        assert [item["job_id"] for item in cuerpo["deleted"]] == ids
+        assert cuerpo["failed"] == []
+
+    def test_uno_que_no_existe_no_arrastra_a_los_demas(self, client):
+        bueno = self._procesado(client, "bueno.pdf")
+        respuesta = client.request(
+            "DELETE", "/api/documents", json={"job_ids": [bueno, "no-existe"]}
+        )
+        cuerpo = respuesta.json()
+        assert [item["job_id"] for item in cuerpo["deleted"]] == [bueno]
+        assert cuerpo["failed"] == [
+            {"job_id": "no-existe", "reason": "El documento no existe"}
+        ]
+
+    def test_un_documento_en_marcha_se_rechaza_y_los_demas_se_borran(self, client):
+        from resolutions.api import main
+
+        bueno = self._procesado(client, "bueno.pdf")
+        corriendo = main.registry.create("corriendo.pdf", main.settings.upload_dir / "c.pdf")
+        main.registry.mark_running(corriendo)
+
+        respuesta = client.request(
+            "DELETE", "/api/documents", json={"job_ids": [corriendo.id, bueno]}
+        )
+        cuerpo = respuesta.json()
+        assert [item["job_id"] for item in cuerpo["deleted"]] == [bueno]
+        assert cuerpo["failed"][0]["job_id"] == corriendo.id
+        assert "proces" in cuerpo["failed"][0]["reason"]
+        # Y sigue ahí: rechazarlo significa no tocarlo.
+        assert main.registry.get(corriendo.id) is not None
+
+    def test_los_repetidos_se_borran_una_sola_vez(self, client):
+        uno = self._procesado(client, "uno.pdf")
+        cuerpo = client.request(
+            "DELETE", "/api/documents", json={"job_ids": [uno, uno]}
+        ).json()
+        assert len(cuerpo["deleted"]) == 1
+        assert cuerpo["failed"] == []
+
+    def test_una_lista_vacia_no_borra_nada(self, client):
+        respuesta = client.request("DELETE", "/api/documents", json={"job_ids": []})
+        assert respuesta.status_code == 422
+
+    def test_hay_un_tope_por_peticion(self, client):
+        from resolutions.api.main import MAX_BULK_DELETE
+
+        respuesta = client.request(
+            "DELETE",
+            "/api/documents",
+            json={"job_ids": [f"x{n}" for n in range(MAX_BULK_DELETE + 1)]},
+        )
+        assert respuesta.status_code == 422
+
+    def test_el_servicio_anuncia_que_sabe_hacerlo(self, client):
+        # La pantalla compara esto para decir "reinicie el servicio" en vez de
+        # enseñar un 404 que parece un error de la petición.
+        salud = client.get("/api/health").json()
+        assert "document-bulk-delete" in salud["features"]
+        assert salud["api_revision"] >= 12
+
+
+# -----------------------------------------------------------------------------
+#  La ficha de un documento ya archivado
+# -----------------------------------------------------------------------------
+#  La pantalla de detalle se dibujaba sólo desde el trabajo en memoria. En cuanto
+#  el área de trabajo se limpiaba -- que ahora pasa al cerrar el informe -- el
+#  documento quedaba en un callejón sin salida: la ficha decía "archivado" y no
+#  llevaba a ninguna parte. El inventario sí lo recuerda, y esto es esa memoria.
+# -----------------------------------------------------------------------------
+
+
+class TestFichaArchivada:
+    def _registrado(self, client, nombre: str = "expediente.pdf") -> str:
+        """Un documento procesado y anotado en el inventario, ya fuera de pantalla."""
+        from resolutions.api import main
+
+        job = main.registry.create(nombre, main.settings.upload_dir / nombre)
+        report = {
+            "document": nombre,
+            "page_count": 7,
+            "review_queue": [{"page": 3, "reason": "el folio no coincide"}],
+            "inventory": {
+                "source_document": nombre,
+                "source_pages": 7,
+                "items": [
+                    {
+                        "file_name": "00086__acta.pdf",
+                        "code": "00086",
+                        "title": "Acta",
+                        "page_count": 2,
+                        "first_page": 1,
+                        "last_page": 2,
+                        "page_numbers": [1, 2],
+                    }
+                ],
+            },
+        }
+        main.registry.mark_done(job, report)
+        main.ledger.record(job.id, report, operator="Ana", source_bytes=1024)
+        # Y se limpia la pantalla, que es lo que hace el cierre del informe.
+        main.registry.remove_finished()
+        return job.id
+
+    def test_un_documento_fuera_de_pantalla_sigue_teniendo_ficha(self, client):
+        job_id = self._registrado(client)
+        respuesta = client.get(f"/api/documents/{job_id}")
+        assert respuesta.status_code == 200
+        cuerpo = respuesta.json()
+        assert cuerpo["source_document"] == "expediente.pdf"
+        assert cuerpo["resolutions"] == 1
+        assert cuerpo["on_screen"] is False
+
+    def test_la_ficha_trae_lo_que_el_documento_produjo(self, client):
+        job_id = self._registrado(client)
+        filas = client.get(f"/api/documents/{job_id}").json()["rows"]
+        assert [fila["code"] for fila in filas] == ["00086"]
+        assert filas[0]["file_name"] == "00086__acta.pdf"
+
+    def test_conserva_los_hechos_del_documento_de_origen(self, client):
+        cuerpo = client.get(f"/api/documents/{self._registrado(client)}").json()
+        assert cuerpo["source_pages"] == 7
+        assert cuerpo["bytes"] == 1024
+        assert cuerpo["review"] == 1
+        assert cuerpo["operator"] == "Ana"
+
+    def test_uno_que_nunca_existio_no_tiene_ficha(self, client):
+        assert client.get("/api/documents/no-existe").status_code == 404
+
+    def test_uno_borrado_deja_de_tener_ficha(self, client):
+        # Borrar es distinto de limpiar: lo borrado no se recuerda.
+        job_id = self._registrado(client)
+        client.delete(f"/api/documents/{job_id}")
+        assert client.get(f"/api/documents/{job_id}").status_code == 404
+
+    def test_el_servicio_anuncia_que_sabe_servirla(self, client):
+        salud = client.get("/api/health").json()
+        assert "document-detail" in salud["features"]
+        assert salud["api_revision"] >= 13

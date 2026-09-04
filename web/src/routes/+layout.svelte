@@ -40,7 +40,7 @@
 
   const ready = $derived(jobStore.finished.length);
   const pending = $derived(
-    jobStore.finished.reduce((sum, job) => sum + (job.report?.review_queue.length ?? 0), 0)
+    jobStore.finished.reduce((sum, job) => sum + (job.report?.review_queue?.length ?? 0), 0)
   );
 
   /**
@@ -94,6 +94,12 @@
           <small>Clasificación y división automática de documentos</small>
         </span>
       </a>
+
+      <!-- La marca de la empresa dueña del software, separada del producto por
+           un filete: son dos cosas distintas y no deben leerse como una sola. -->
+      <span class="owner" title="SIAR — Hacemos todo por su información">
+        <img src="/siar-marca.png" alt="SIAR" width="72" height="38" />
+      </span>
 
       <nav class="tabs">
         {#each TABS as tab (tab.href)}
@@ -175,6 +181,21 @@
   .titles small {
     font-size: 0.72rem;
     color: var(--muted);
+  }
+
+  .owner {
+    display: flex;
+    align-items: center;
+    border-left: 1px solid var(--hairline);
+    padding-left: 0.9rem;
+  }
+  .owner img {
+    width: auto;
+    height: 19px;
+    border-radius: 5px;
+    /* Transparente en claro; en oscuro, una placa para no teñir la marca. */
+    background: var(--logo-plate);
+    padding: 3px 6px;
   }
 
   .tabs {

@@ -1,5 +1,7 @@
 <script lang="ts">
+  import { deleteDocument, renameDocument } from '$lib/api';
   import { formatBytes } from '$lib/format';
+  import { jobStore } from '$lib/jobs.svelte';
 
   /**
    * One processed document, however it is being remembered.
@@ -30,71 +32,265 @@
 
   interface Props {
     entry: Entry;
+    /** Called after a successful rename or delete, so the page can reload. */
+    onchange?: () => void;
+    /**
+     * Si la tarjeta está marcada, cuando la lista permite marcar varias.
+     *
+     * Ausente significa que no hay selección en marcha, y entonces la casilla
+     * no se dibuja: una casilla que no sirve para nada ocupa el mismo sitio que
+     * una que sí, y en una lista de doscientas tarjetas eso se nota.
+     */
+    selected?: boolean;
+    /** Marcar o desmarcar esta tarjeta. Sin esto no hay casilla. */
+    onselect?: (jobId: string, shift: boolean) => void;
   }
 
-  let { entry }: Props = $props();
+  let { entry, onchange, selected, onselect }: Props = $props();
+
+  /**
+   * The card is a folder, an editor or a warning -- never two at once.
+   *
+   * A rename field tucked into a corner of the card would sit next to a
+   * clickable surface that navigates away, and the operator would lose what
+   * they typed by missing the input by four pixels.
+   */
+  type Mode = 'idle' | 'renaming' | 'confirming';
+  let mode = $state<Mode>('idle');
+  let busy = $state(false);
+  let failure = $state<string | null>(null);
+  let draft = $state('');
 
   const clock = $derived(
     new Date(entry.at).toLocaleTimeString('es', { hour: '2-digit', minute: '2-digit' })
   );
+
+  function startRename() {
+    // Seeded from the entry each time the editor opens: an abandoned edit must
+    // not come back the next time somebody clicks "renombrar".
+    draft = entry.name;
+    failure = null;
+    mode = 'renaming';
+  }
+
+  async function save() {
+    const name = draft.trim();
+    if (!name || name === entry.name) {
+      mode = 'idle';
+      return;
+    }
+    busy = true;
+    failure = null;
+    try {
+      await renameDocument(entry.jobId, name);
+      mode = 'idle';
+      onchange?.();
+    } catch (problem) {
+      failure = (problem as Error).message;
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function remove() {
+    busy = true;
+    failure = null;
+    try {
+      await deleteDocument(entry.jobId);
+      // Un documento borrado no puede seguir pendiente de revisión: la copia
+      // que Revisión conserva de él se suelta con el documento.
+      jobStore.forget(entry.jobId);
+      mode = 'idle';
+      onchange?.();
+    } catch (problem) {
+      failure = (problem as Error).message;
+      mode = 'idle';
+    } finally {
+      busy = false;
+    }
+  }
 </script>
 
-<svelte:element
-  this={entry.live ? 'a' : 'div'}
+<div
   class="card"
   class:failed={entry.failed}
-  class:openable={entry.live}
-  href={entry.live ? `/documento/${entry.jobId}` : undefined}
+  class:openable={entry.live && mode === 'idle'}
+  class:picking={!!onselect}
 >
   <span class="tab" aria-hidden="true"></span>
 
-  <header>
-    <span class="name" title={entry.name}>{entry.name}</span>
-    <time class="tabular">{clock}</time>
-  </header>
-
-  {#if entry.failed}
-    <p class="error" title={entry.error ?? ''}>{entry.error ?? 'No se pudo procesar'}</p>
+  {#if mode === 'renaming'}
+    <div class="panel">
+      <label>
+        <span>Nombre del documento</span>
+        <!-- svelte-ignore a11y_autofocus -->
+        <input
+          bind:value={draft}
+          autofocus
+          spellcheck="false"
+          onkeydown={(event) => {
+            if (event.key === 'Enter') save();
+            if (event.key === 'Escape') mode = 'idle';
+          }}
+        />
+      </label>
+      <p class="note">
+        Cambia el nombre en el inventario y en la pantalla. Los PDF generados
+        conservan el suyo, que sale del número de resolución.
+      </p>
+      <div class="actions">
+        <button class="primary" onclick={save} disabled={busy || !draft.trim()}>
+          {busy ? 'guardando…' : 'guardar'}
+        </button>
+        <button onclick={() => (mode = 'idle')} disabled={busy}>cancelar</button>
+      </div>
+      {#if failure}<p class="error">{failure}</p>{/if}
+    </div>
+  {:else if mode === 'confirming'}
+    <div class="panel">
+      <p class="warn">
+        Se eliminarán <b>{entry.resolutions}</b>
+        {entry.resolutions === 1 ? 'resolución' : 'resoluciones'} de
+        <b>{entry.name}</b>: los PDF generados y sus filas del inventario. No se puede
+        deshacer.
+      </p>
+      <div class="actions">
+        <button class="danger" onclick={remove} disabled={busy}>
+          {busy ? 'eliminando…' : 'sí, eliminar'}
+        </button>
+        <button onclick={() => (mode = 'idle')} disabled={busy}>cancelar</button>
+      </div>
+      {#if failure}<p class="error">{failure}</p>{/if}
+    </div>
   {:else}
-    <!-- Two numbers, always in the same place, always meaning the same thing. -->
-    <dl class="figures">
-      <div>
-        <dt>Resoluciones</dt>
-        <dd class="tabular">{entry.resolutions}</dd>
-      </div>
-      <div>
-        <dt>Páginas</dt>
-        <dd class="tabular">{entry.pages || '—'}</dd>
-      </div>
-      <div>
-        <dt>Tamaño</dt>
-        <dd class="tabular">{entry.bytes ? formatBytes(entry.bytes) : '—'}</dd>
-      </div>
-    </dl>
-  {/if}
-
-  <footer>
-    {#if entry.operator}
-      <span class="by">{entry.operator}</span>
-    {:else}
-      <span class="by anon">sin operador</span>
+    {#if onselect}
+      <!--
+        Fuera del enlace a propósito: dentro, marcar la casilla navegaría al
+        detalle del documento y el operador perdería la selección entera.
+      -->
+      <label class="pick" title="Seleccionar para eliminar en lote">
+        <input
+          type="checkbox"
+          checked={selected ?? false}
+          onclick={(event) => onselect(entry.jobId, event.shiftKey)}
+        />
+        <span class="sr">Seleccionar {entry.name}</span>
+      </label>
     {/if}
+    <!--
+      Lleva al detalle esté en pantalla o archivado. Antes sólo era un enlace
+      mientras el trabajo seguía en memoria, así que en cuanto se limpiaba el
+      área de trabajo la ficha dejaba de poder abrirse: la tarjeta se veía
+      pinchable y no llevaba a ninguna parte.
+    -->
+    <a class="body" href={`/documento/${entry.jobId}`}>
+      <header>
+        <span class="name" title={entry.name}>{entry.name}</span>
+        <time class="tabular">{clock}</time>
+      </header>
 
-    {#if entry.review}
-      <span class="review" title={`${entry.review} páginas requieren revisión`}>
-        ⚠ {entry.review}
+      {#if entry.failed}
+        <p class="error" title={entry.error ?? ''}>{entry.error ?? 'No se pudo procesar'}</p>
+      {:else}
+        <!-- Two numbers, always in the same place, always meaning the same thing. -->
+        <dl class="figures">
+          <div>
+            <dt>Resoluciones</dt>
+            <dd class="tabular">{entry.resolutions}</dd>
+          </div>
+          <div>
+            <dt>Páginas</dt>
+            <dd class="tabular">{entry.pages || '—'}</dd>
+          </div>
+          <div>
+            <dt>Tamaño</dt>
+            <dd class="tabular">{entry.bytes ? formatBytes(entry.bytes) : '—'}</dd>
+          </div>
+        </dl>
+      {/if}
+    </a>
+
+    <footer>
+      {#if entry.operator}
+        <span class="by">{entry.operator}</span>
+      {:else}
+        <span class="by anon">sin operador</span>
+      {/if}
+
+      {#if entry.review}
+        <span class="review" title={`${entry.review} páginas requieren revisión`}>
+          ⚠ {entry.review}
+        </span>
+      {/if}
+
+      <span class="tools">
+        <button onclick={startRename} title="Cambiar el nombre del documento">renombrar</button>
+        <button
+          class="quiet"
+          onclick={() => {
+            failure = null;
+            mode = 'confirming';
+          }}
+          title="Eliminar el documento, sus PDF y su inventario"
+        >
+          eliminar
+        </button>
+        <!--
+          Un solo enlace, esté el documento en pantalla o archivado: desde que
+          la ficha se dibuja también desde el inventario, los dos abren. Poner
+          además el rótulo "archivado" metía un elemento de más en un pie que no
+          reparte, y la fila se salía de la tarjeta.
+        -->
+        <a class="open" href={`/documento/${entry.jobId}`} title={entry.live ? undefined : 'Archivado: se dibuja desde el inventario'}>
+          ver detalle →
+        </a>
       </span>
-    {/if}
+    </footer>
 
-    {#if entry.live}
-      <span class="open" aria-hidden="true">ver detalle →</span>
-    {:else}
-      <span class="archived">archivado</span>
-    {/if}
-  </footer>
-</svelte:element>
+    {#if failure}<p class="error">{failure}</p>{/if}
+  {/if}
+</div>
 
 <style>
+  /* La casilla se apoya sobre la esquina de la tarjeta sin empujar nada. */
+  .pick {
+    position: absolute;
+    top: 0.55rem;
+    left: 0.55rem;
+    z-index: 2;
+    display: grid;
+    place-items: center;
+    padding: 0.15rem;
+    cursor: pointer;
+  }
+
+  .pick input {
+    width: 1rem;
+    height: 1rem;
+    cursor: pointer;
+    accent-color: var(--accent);
+  }
+
+  /*
+    La casilla flota sobre la esquina, así que el nombre tiene que apartarse o
+    queda debajo. Se aparta sólo el renglón del título -- las cifras y el pie
+    siguen usando el ancho entero -- porque es la única línea que llega hasta
+    ese borde.
+  */
+  .card.picking header {
+    padding-left: 1.55rem;
+  }
+
+  /* Sólo para quien lee la pantalla en voz alta. */
+  .sr {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
   /* Drawn as a folder: a finished document is something you open, not a row you
      scroll past. */
   .card {
@@ -118,6 +314,16 @@
     border-color: var(--accent);
     transform: translateY(-1px);
     box-shadow: 0 8px 22px rgb(0 0 0 / 0.12);
+  }
+
+  /* The clickable part of the card. The tools live outside it, because a button
+     inside a link is neither valid HTML nor predictable to click. */
+  .body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    color: inherit;
+    text-decoration: none;
   }
 
   .tab {
@@ -192,6 +398,9 @@
 
   footer {
     display: flex;
+    /* Que reparta antes que desbordar: la tarjeta tiene un ancho fijo en la
+       rejilla y un pie que no se rompe se sale por el borde. */
+    flex-wrap: wrap;
     align-items: center;
     gap: 0.45rem;
     border-top: 1px solid var(--rule);
@@ -224,14 +433,109 @@
     color: var(--warning);
   }
 
-  .open,
-  .archived {
+  .tools {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
     margin-left: auto;
     flex-shrink: 0;
+  }
+  .tools button {
+    border: 0;
+    background: none;
+    padding: 0;
+    font: inherit;
     font-size: 0.7rem;
     color: var(--muted);
+    cursor: pointer;
   }
+  .tools button:hover {
+    color: var(--ink);
+  }
+  .tools button.quiet:hover {
+    color: var(--critical);
+  }
+
+  .open,
   .card.openable:hover .open {
     color: var(--accent);
+  }
+
+  /* The editor and the confirmation take the whole card: one thing at a time. */
+  .panel {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+  .panel label {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+  }
+  .panel label span {
+    font-size: 0.58rem;
+    font-weight: 600;
+    letter-spacing: 0.055em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .panel input {
+    border: 1px solid var(--hairline);
+    border-radius: 7px;
+    background: var(--plane);
+    padding: 0.35rem 0.55rem;
+    font: inherit;
+    font-size: 0.85rem;
+    color: inherit;
+    outline: none;
+  }
+  .panel input:focus {
+    border-color: var(--accent);
+  }
+  .note {
+    margin: 0;
+    font-size: 0.68rem;
+    line-height: 1.45;
+    color: var(--muted);
+  }
+  .warn {
+    margin: 0;
+    font-size: 0.78rem;
+    line-height: 1.45;
+    color: var(--ink-2);
+  }
+  .warn b {
+    color: var(--ink);
+  }
+
+  .actions {
+    display: flex;
+    gap: 0.4rem;
+  }
+  .actions button {
+    border: 1px solid var(--hairline);
+    border-radius: 7px;
+    background: transparent;
+    padding: 0.25rem 0.7rem;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .actions button.primary {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .actions button.danger {
+    border-color: var(--critical);
+    color: var(--critical);
+  }
+  .actions button.danger:hover {
+    background: var(--critical);
+    color: #fff;
+  }
+  .actions button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 </style>
